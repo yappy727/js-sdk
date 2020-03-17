@@ -601,6 +601,194 @@ export class RecordClient {
     );
   }
 
+  public async upsertAllRecords(params: {
+    app: AppID;
+    records: Array<{
+      updateKey: { field: string; value: string | number };
+      record?: object;
+      revision?: Revision;
+    }>;
+  }) {
+    const fields = Array.from(
+      new Set(params.records.map(record => record.updateKey.field))
+    );
+    const existsRecords = await this.getAllRecordsWithId({
+      app: params.app,
+      fields
+    });
+    const recordsChunks = this.separateIntoChunksForUpsertRecords(
+      params.records,
+      existsRecords
+    );
+    return this.upsertAllRecordsRecursive(params.app, recordsChunks, []);
+  }
+
+  private async upsertAllRecordsRecursive(
+    app: AppID,
+    recordsChunks: Array<
+      Array<{
+        requestIndex: number;
+        alreadyExist: boolean;
+        updateKey: {
+          field: string;
+          value: string | number;
+        };
+        record?: object | undefined;
+        revision?: string | number | undefined;
+      }>
+    >,
+    results: Array<{ id: string; revision: string }>
+  ): Promise<Array<{ id: string; revision: string }>> {
+    if (recordsChunks.length === 0) {
+      return results;
+    }
+    const newResults = await this.upsertAllRecordsWithBulkRequest(
+      app,
+      recordsChunks[0]
+    );
+    return this.upsertAllRecordsRecursive(
+      app,
+      recordsChunks.slice(1),
+      results.concat(newResults)
+    );
+  }
+
+  private async upsertAllRecordsWithBulkRequest(
+    app: AppID,
+    records: Array<{
+      requestIndex: number;
+      alreadyExist: boolean;
+      updateKey: {
+        field: string;
+        value: string | number;
+      };
+      record?: object | undefined;
+      revision?: string | number | undefined;
+    }>
+  ): Promise<Array<{ id: string; revision: string }>> {
+    const recordsForUpdate = records.filter(record => record.alreadyExist);
+    const recordsForInsert = records.filter(record => !record.alreadyExist);
+
+    const indicesOfUpdate = recordsForUpdate.map(record => record.requestIndex);
+    const indicesOfInsert = recordsForInsert.map(record => record.requestIndex);
+
+    const recordsChunkForUpdateRequest = this.separateArrayRecursive(
+      100,
+      [],
+      recordsForUpdate.map(({ requestIndex, alreadyExist, ...rest }) => rest)
+    );
+    const recordsChunkForInsertRequest = this.separateArrayRecursive(
+      100,
+      [],
+      recordsForInsert.map(({ record, updateKey }) => ({
+        ...record,
+        [updateKey.field]: { value: updateKey.value }
+      }))
+    );
+
+    const updateRequests = recordsChunkForUpdateRequest.map(recordsChunk => ({
+      method: "PUT",
+      api: this.buildPathWithGuestSpaceId({ endpointName: "records" }),
+      payload: {
+        app,
+        records: recordsChunk
+      }
+    }));
+    const insertRequests = recordsChunkForInsertRequest.map(recordsChunk => ({
+      method: "POST",
+      api: this.buildPathWithGuestSpaceId({ endpointName: "records" }),
+      payload: {
+        app,
+        records: recordsChunk
+      }
+    }));
+
+    const { results } = await this.bulkRequestClient.send({
+      requests: [...updateRequests, ...insertRequests]
+    });
+
+    const updateResults = results.slice(0, updateRequests.length) as Array<{
+      records: Array<{ id: string; revision: string }>;
+    }>;
+    const insertResults = results.slice(updateRequests.length) as Array<{
+      ids: string[];
+      revisions: string[];
+    }>;
+
+    const updatedRecordsWithIndices = updateResults
+      .map(result => result.records)
+      .reduce((acc, updatedRecordsChunk) => {
+        return acc.concat(updatedRecordsChunk);
+      }, [])
+      .map((updatedRecord, index) => ({
+        record: updatedRecord,
+        index: indicesOfUpdate[index]
+      }));
+    const insertedRecordsWithIndices = insertResults
+      .map(result => {
+        const { ids, revisions } = result;
+        return ids.map((id, i) => ({ id, revision: revisions[i] }));
+      })
+      .reduce((acc, insertedRecordsChunk) => {
+        return acc.concat(insertedRecordsChunk);
+      }, [])
+      .map((insertedRecord, index) => ({
+        record: insertedRecord,
+        index: indicesOfInsert[index]
+      }));
+
+    return updatedRecordsWithIndices
+      .concat(insertedRecordsWithIndices)
+      .sort((recordWithIndexA, recordWithIndexB) => {
+        return recordWithIndexA.index - recordWithIndexB.index;
+      })
+      .map(recordWithIndex => recordWithIndex.record);
+  }
+
+  private separateIntoChunksForUpsertRecords(
+    records: Array<{
+      updateKey: { field: string; value: string | number };
+      record?: object;
+      revision?: Revision;
+    }>,
+    existsRecords: Record[]
+  ) {
+    const chunks = [];
+    let processedRecords = [];
+    let numOfUpdate: number = 0;
+    let numOfInsert: number = 0;
+    const numOfRequests = (numOfRecords: number) => {
+      return (
+        Math.floor(numOfRecords / 100) + (numOfRecords % 100 === 0 ? 0 : 1)
+      );
+    };
+
+    for (let i = 0; i < records.length; i++) {
+      if (
+        numOfRequests(numOfUpdate + 1) + numOfRequests(numOfInsert) > 20 ||
+        numOfRequests(numOfUpdate) + numOfRequests(numOfInsert + 1) > 20
+      ) {
+        chunks.push(processedRecords);
+        numOfUpdate = 0;
+        numOfInsert = 0;
+        processedRecords = [];
+      }
+      const { field: keyField, value: keyValue } = records[i].updateKey;
+      const alreadyExist = existsRecords.some(
+        record => record[keyField].value === keyValue
+      );
+      processedRecords.push({ ...records[i], requestIndex: i, alreadyExist });
+
+      if (alreadyExist) {
+        numOfUpdate += 1;
+      } else {
+        numOfInsert += 1;
+      }
+    }
+    chunks.push(processedRecords);
+    return chunks;
+  }
+
   public addRecordComment(params: {
     app: AppID;
     record: RecordID;
