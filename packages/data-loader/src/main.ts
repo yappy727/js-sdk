@@ -4,7 +4,6 @@ import { buildRestAPIClient } from "./api";
 import { buildPrinter } from "./printer";
 import { importRecords } from "./commands/import";
 
-// FIXME: It doesn't display an error when not passing any arguments.
 // eslint-disable-next-line no-unused-expressions
 yargs
   .command(
@@ -67,4 +66,6 @@ yargs
   })
   .option("file-path", {
     describe: "file path",
-  }).argv;
+  })
+  .strict()
+  .demandCommand(1).argv;
