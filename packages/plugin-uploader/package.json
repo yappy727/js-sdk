@@ -44,8 +44,8 @@
   "homepage": "https://github.com/kintone/js-sdk/tree/master/packages/plugin-uploader#readme",
   "dependencies": {
     "chalk": "^4.1.0",
-    "inquirer": "^7.3.3",
-    "meow": "^8.0.0",
+    "inquirer": "^9.0.0",
+    "meow": "^12.1.0",
     "os-locale": "^5.0.0",
     "puppeteer": "5.5.0"
   },
